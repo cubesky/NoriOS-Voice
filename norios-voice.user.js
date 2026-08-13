@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoriOS Voice
 // @namespace    https://cubesky.github.io/NoriOS-Voice/
-// @version      4.3.0
+// @version      4.4.0
 // @description  NoriOS sherpa-onnx voice input, KWS wake word, VAD auto-end and local model cache
 // @author       CubeSky
 // @match        http://*/*
@@ -128,8 +128,8 @@
 
   window[KEY] = state;
 
-  const log = (...args) => console.log('[norios-voice 4.3]', ...args);
-  const warn = (...args) => console.warn('[norios-voice 4.3]', ...args);
+  const log = (...args) => console.log('[norios-voice 4.4]', ...args);
+  const warn = (...args) => console.warn('[norios-voice 4.4]', ...args);
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -2555,18 +2555,36 @@
     delete window[KEY];
   };
 
-  if (!attachButton()) {
-    const retry = new MutationObserver(() => {
-      if (attachButton()) retry.disconnect();
-    });
+  function startNoriOSVoice() {
+    if (state.destroyed) return;
 
-    retry.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-    });
+    if (!attachButton()) {
+      const retry = new MutationObserver(() => {
+        if (state.destroyed) {
+          retry.disconnect();
+          return;
+        }
 
-    state.observers.push(retry);
+        if (attachButton()) {
+          retry.disconnect();
+        }
+      });
+
+      retry.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+
+      state.observers.push(retry);
+    }
+
+    watchReactRerenders();
   }
 
-  watchReactRerenders();
+  // Even with @run-at document-idle, some target pages still finish
+  // React/form/button initialization asynchronously. Delay the actual
+  // NoriOS Voice bootstrap by 1 second so the page has time to settle.
+  setTimeout(() => {
+    startNoriOSVoice();
+  }, 1000);
 })();
