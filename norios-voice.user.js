@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         NoriOS Voice
 // @namespace    https://cubesky.github.io/NoriOS-Voice/
-// @version      4.0.0
+// @version      4.2.0
 // @description  NoriOS sherpa-onnx voice input, KWS wake word, VAD auto-end and local model cache
 // @author       CubeSky
-// @match        https://os.inori.ai/*
+// @match        http://*/*
+// @match        https://*/*
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -91,6 +92,10 @@
     ready: false,
     isHolding: false,
     submitTimer: null,
+    submitGeneration: 0,
+    lastSubmittedText: '',
+    lastSubmittedAt: 0,
+    submitDedupWindowMs: 2500,
     observers: [],
     progressOverlay: null,
     progressBar: null,
@@ -121,8 +126,8 @@
 
   window[KEY] = state;
 
-  const log = (...args) => console.log('[norios-voice]', ...args);
-  const warn = (...args) => console.warn('[norios-voice]', ...args);
+  const log = (...args) => console.log('[norios-voice 4.2]', ...args);
+  const warn = (...args) => console.warn('[norios-voice 4.2]', ...args);
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -1749,12 +1754,7 @@
     // Recognition is complete; restore the normal input frame immediately.
     setTriggeredInputVisual(false);
 
-    clearTimeout(state.submitTimer);
-    state.submitTimer = setTimeout(() => {
-      if (!state.destroyed && input.isConnected) {
-        dispatchEnter(input);
-      }
-    }, CFG.submitDelayMs);
+    scheduleRecognizedSubmission(input, text);
 
     setButtonState('idle');
   }
@@ -2177,21 +2177,119 @@
     }));
   }
 
-  function dispatchEnter(input) {
-    input.focus();
+  function submitRecognizedInput(input) {
+    if (!input?.isConnected) return false;
 
-    for (const type of ['keydown', 'keypress', 'keyup']) {
-      input.dispatchEvent(new KeyboardEvent(type, {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        charCode: type === 'keypress' ? 13 : 0,
+    // 1) Prefer a submit button that is a DIRECT sibling of the input.
+    //
+    // Example:
+    // <div>
+    //   <input maxlength="100">
+    //   <button type="submit">...</button>
+    // </div>
+    //
+    // Calling .click() preserves the page/framework's normal button handlers.
+    const parent = input.parentElement;
+
+    if (parent) {
+      for (const child of parent.children) {
+        if (
+          child !== input &&
+          child instanceof HTMLButtonElement &&
+          String(child.type).toLowerCase() === 'submit' &&
+          !child.disabled
+        ) {
+          log('submit via sibling button[type=submit]');
+          child.click();
+          return true;
+        }
+      }
+    }
+
+    // 2) Otherwise submit the associated/closest form through requestSubmit().
+    // requestSubmit() preserves constraint validation and dispatches a normal
+    // submit event, unlike form.submit(), which bypasses submit handlers.
+    const form =
+      input.form ||
+      input.closest?.('form');
+
+    if (form) {
+      if (typeof form.requestSubmit === 'function') {
+        log('submit via form.requestSubmit()');
+        form.requestSubmit();
+        return true;
+      }
+
+      // Extremely old-browser fallback: dispatch a cancelable submit event.
+      // Do NOT call form.submit(), because that bypasses framework submit logic.
+      const event = new Event('submit', {
         bubbles: true,
         cancelable: true,
-        composed: true,
-      }));
+      });
+
+      log('submit via synthetic form submit event');
+      return form.dispatchEvent(event);
     }
+
+    warn(
+      'recognized text was entered, but no sibling button[type=submit] ' +
+      'or containing form was found; submission skipped'
+    );
+
+    return false;
+  }
+
+  function scheduleRecognizedSubmission(input, text) {
+    const normalized = String(text || '').trim();
+    if (!normalized || !input?.isConnected) return false;
+
+    const now = Date.now();
+
+    // KWS/VAD may expose the same final Result twice while Stop flushes.
+    if (
+      normalized === state.lastSubmittedText &&
+      now - state.lastSubmittedAt < state.submitDedupWindowMs
+    ) {
+      log(
+        'duplicate submit suppressed:',
+        normalized,
+        `${now - state.lastSubmittedAt}ms`
+      );
+      return false;
+    }
+
+    clearTimeout(state.submitTimer);
+
+    // Invalidate every older scheduled submission.
+    const generation = ++state.submitGeneration;
+
+    state.submitTimer = setTimeout(() => {
+      if (
+        state.destroyed ||
+        generation !== state.submitGeneration ||
+        !input.isConnected
+      ) {
+        return;
+      }
+
+      const firedAt = Date.now();
+
+      if (
+        normalized === state.lastSubmittedText &&
+        firedAt - state.lastSubmittedAt < state.submitDedupWindowMs
+      ) {
+        log('duplicate submit suppressed at dispatch:', normalized);
+        return;
+      }
+
+      state.lastSubmittedText = normalized;
+      state.lastSubmittedAt = firedAt;
+
+      log('submit recognized text:', normalized);
+      submitRecognizedInput(input);
+    }, CFG.submitDelayMs);
+
+    return true;
   }
 
   async function beginHold(e) {
@@ -2277,12 +2375,7 @@
 
       setReactInputValue(input, text);
 
-      clearTimeout(state.submitTimer);
-      state.submitTimer = setTimeout(() => {
-        if (!state.destroyed && input.isConnected) {
-          dispatchEnter(input);
-        }
-      }, CFG.submitDelayMs);
+      scheduleRecognizedSubmission(input, text);
 
       setButtonState('idle');
     } catch (err) {
@@ -2403,6 +2496,7 @@
   state.destroy = () => {
     state.destroyed = true;
     clearTimeout(state.submitTimer);
+    state.submitGeneration++;
     setTriggeredInputVisual(false);
 
     try {
