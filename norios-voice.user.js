@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoriOS Voice
 // @namespace    https://cubesky.github.io/NoriOS-Voice/
-// @version      4.4.0
+// @version      4.5.0
 // @description  NoriOS sherpa-onnx voice input, KWS wake word, VAD auto-end and local model cache
 // @author       CubeSky
 // @match        http://*/*
@@ -92,6 +92,7 @@
     iframeWindow: null,
     loadingPromise: null,
     ready: false,
+    activeAssetBase: null,
     isHolding: false,
     submitTimer: null,
     submitGeneration: 0,
@@ -128,8 +129,105 @@
 
   window[KEY] = state;
 
-  const log = (...args) => console.log('[norios-voice 4.4]', ...args);
-  const warn = (...args) => console.warn('[norios-voice 4.4]', ...args);
+  const log = (...args) => console.log('[norios-voice 4.5]', ...args);
+  const warn = (...args) => console.warn('[norios-voice 4.5]', ...args);
+
+  function getPrimaryAssetBase() {
+    return CFG.assetBases[0];
+  }
+
+  function getFallbackAssetBase() {
+    return CFG.assetBases[1] || null;
+  }
+
+  function getActiveAssetBase() {
+    return state.activeAssetBase || getPrimaryAssetBase();
+  }
+
+  function assetUrl(filename, base = getActiveAssetBase()) {
+    return new URL(filename, base).href;
+  }
+
+  function switchActiveAssetBase(base) {
+    if (!base) return;
+    state.activeAssetBase = base;
+    log('ASR asset base:', base);
+  }
+
+  async function fetchWithAssetFallback(
+    filename,
+    options = {},
+    onFallback = null
+  ) {
+    const bases = Array.from(
+      new Set(CFG.assetBases.filter(Boolean))
+    );
+
+    let lastError = null;
+
+    for (let i = 0; i < bases.length; i++) {
+      const base = bases[i];
+      const url = assetUrl(filename, base);
+
+      try {
+        const response = await fetch(url, {
+          mode: 'cors',
+          credentials: 'omit',
+          cache: 'no-cache',
+          ...options,
+        });
+
+        if (!response.ok) {
+          throw new Error(
+            `HTTP ${response.status} ${response.statusText}`
+          );
+        }
+
+        const contentType =
+          (response.headers.get('content-type') || '').toLowerCase();
+
+        if (
+          /\.(?:js|mjs|json|txt)$/i.test(filename) &&
+          contentType.includes('text/html')
+        ) {
+          throw new Error('返回了 HTML，而不是目标资源');
+        }
+
+        if (i > 0) {
+          onFallback?.(base, url);
+        }
+
+        switchActiveAssetBase(base);
+
+        return {
+          response,
+          base,
+          url,
+        };
+      } catch (err) {
+        lastError = err;
+        warn('ASR asset fetch failed:', url, err);
+
+        if (i + 1 < bases.length) {
+          const nextBase = bases[i + 1];
+          onFallback?.(
+            nextBase,
+            assetUrl(filename, nextBase)
+          );
+        }
+      }
+    }
+
+    throw new Error(
+      `ASR 资源加载失败: ${filename}\n` +
+      `已尝试:\n` +
+      bases.map(
+        base => `  ${assetUrl(filename, base)}`
+      ).join('\n') +
+      `\n最后错误: ${lastError?.message || lastError}`
+    );
+  }
+
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -488,30 +586,40 @@
     }
   }
 
-  async function downloadModelBlobWithProgress(url) {
-    updateProgress(22, '正在下载中文语音模型', '正在建立模型数据连接…');
+  async function downloadModelBlobWithProgress(filename) {
+    updateProgress(
+      22,
+      '正在下载中文语音模型',
+      '正在连接 Hugging Face…'
+    );
 
-    const response = await fetch(url, {
-      mode: 'cors',
-      credentials: 'omit',
-      cache: 'no-cache',
-    });
-
-    if (!response.ok) {
-      throw new Error(
-        `模型下载失败: HTTP ${response.status} ${response.statusText}`
+    const { response, base } =
+      await fetchWithAssetFallback(
+        filename,
+        {},
+        (fallbackBase) => {
+          updateProgress(
+            22,
+            '切换国内镜像',
+            `正在尝试 ${fallbackBase}`
+          );
+        }
       );
-    }
 
-    const total = Number(response.headers.get('content-length')) || 0;
+    switchActiveAssetBase(base);
+
+    const total =
+      Number(response.headers.get('content-length')) || 0;
 
     if (!response.body?.getReader) {
       const blob = await response.blob();
+
       updateProgress(
         89,
         '模型下载完成',
         `${(blob.size / 1024 / 1024).toFixed(1)} MiB`
       );
+
       return blob;
     }
 
@@ -529,14 +637,18 @@
       if (total > 0) {
         updateProgress(
           22 + (loaded / total) * 66,
-          '正在下载中文语音模型',
+          base === getPrimaryAssetBase()
+            ? '正在下载中文语音模型'
+            : '正在通过国内镜像下载模型',
           `${(loaded / 1024 / 1024).toFixed(1)} MiB / ` +
           `${(total / 1024 / 1024).toFixed(1)} MiB`
         );
       } else {
         updateProgress(
           55,
-          '正在下载中文语音模型',
+          base === getPrimaryAssetBase()
+            ? '正在下载中文语音模型'
+            : '正在通过国内镜像下载模型',
           `已接收 ${(loaded / 1024 / 1024).toFixed(1)} MiB`
         );
       }
@@ -579,7 +691,7 @@
     updateProgress(18, '本地没有模型缓存', '首次运行需要下载模型…');
 
     const blob = await downloadModelBlobWithProgress(
-      assetUrl(CFG.cacheDataFile, getPrimaryAssetBase())
+      CFG.cacheDataFile
     );
 
     try {
@@ -1899,6 +2011,7 @@
     if (state.loadingPromise) return state.loadingPromise;
 
     state.loadingPromise = (async () => {
+      switchActiveAssetBase(getPrimaryAssetBase());
       setButtonState('loading');
       createProgressOverlay();
       updateProgress(2, '准备运行环境', '正在创建隔离 WASM 容器…');
@@ -1931,7 +2044,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <base href="${getActiveAssetBase()}">
+  <base href="${getPrimaryAssetBase()}">
 </head>
 <body>
   <div id="status">Loading...</div>
@@ -1992,7 +2105,12 @@
           }
         );
 
-        state.activeAssetBase = base;
+        switchActiveAssetBase(base);
+
+        const baseElement = doc.querySelector('base');
+        if (baseElement) {
+          baseElement.href = base;
+        }
 
         const scriptText = await response.text();
         const trimmed = scriptText.trimStart();
