@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoriOS Voice
 // @namespace    https://cubesky.github.io/NoriOS-Voice/
-// @version      4.2.0
+// @version      4.3.0
 // @description  NoriOS sherpa-onnx voice input, KWS wake word, VAD auto-end and local model cache
 // @author       CubeSky
 // @match        http://*/*
@@ -22,8 +22,10 @@
     input: 'input[maxlength="100"]',
 
     // Official sherpa-onnx Chinese Zipformer CTC VAD+ASR WebAssembly demo.
-    assetBase:
+    assetBases: [
       'https://huggingface.co/spaces/k2-fsa/web-assembly-vad-asr-sherpa-onnx-zh-zipformer-ctc/resolve/main/',
+      'https://hf-mirror.com/spaces/k2-fsa/web-assembly-vad-asr-sherpa-onnx-zh-zipformer-ctc/resolve/main/',
+    ],
 
     scripts: [
       'sherpa-onnx-asr.js',
@@ -126,8 +128,8 @@
 
   window[KEY] = state;
 
-  const log = (...args) => console.log('[norios-voice 4.2]', ...args);
-  const warn = (...args) => console.warn('[norios-voice 4.2]', ...args);
+  const log = (...args) => console.log('[norios-voice 4.3]', ...args);
+  const warn = (...args) => console.warn('[norios-voice 4.3]', ...args);
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -577,7 +579,7 @@
     updateProgress(18, '本地没有模型缓存', '首次运行需要下载模型…');
 
     const blob = await downloadModelBlobWithProgress(
-      CFG.assetBase + CFG.cacheDataFile
+      assetUrl(CFG.cacheDataFile, getPrimaryAssetBase())
     );
 
     try {
@@ -1929,7 +1931,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <base href="${CFG.assetBase}">
+  <base href="${getActiveAssetBase()}">
 </head>
 <body>
   <div id="status">Loading...</div>
@@ -1978,7 +1980,40 @@
           );
         }
 
-        await loadScriptIntoFrame(doc, CFG.assetBase + file);
+        const { response, base } = await fetchWithAssetFallback(
+          file,
+          {},
+          (fallbackBase) => {
+            updateProgress(
+              88,
+              '切换国内镜像',
+              `正在尝试 ${fallbackBase}${file}`
+            );
+          }
+        );
+
+        state.activeAssetBase = base;
+
+        const scriptText = await response.text();
+        const trimmed = scriptText.trimStart();
+
+        if (trimmed.startsWith('<')) {
+          throw new Error(
+            `ASR 脚本返回 HTML: ${assetUrl(file, base)}`
+          );
+        }
+
+        const blob = new Blob([scriptText], {
+          type: 'text/javascript',
+        });
+
+        const blobUrl = URL.createObjectURL(blob);
+
+        try {
+          await loadScriptIntoFrame(doc, blobUrl);
+        } finally {
+          URL.revokeObjectURL(blobUrl);
+        }
       }
 
       updateProgress(97, '初始化语音识别引擎', '正在创建 VAD / ASR 实例…');
