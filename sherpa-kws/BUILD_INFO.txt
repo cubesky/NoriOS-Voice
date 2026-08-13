@@ -1,0 +1,8 @@
+sherpa_ref=master
+sherpa_commit=3e409338959097c6518998c9b72757db257f5f6f
+emsdk_version=4.0.23
+model=sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20
+encoder=encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx
+decoder=decoder-epoch-13-avg-2-chunk-16-left-64.onnx
+joiner=joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx
+github_sha=5353517cb61125f497ca9b0aad0f63068d91d68e
