@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoriOS Voice
 // @namespace    https://cubesky.github.io/NoriOS-Voice/
-// @version      4.5.0
+// @version      4.8.0
 // @description  NoriOS sherpa-onnx voice input, KWS wake word, VAD auto-end and local model cache
 // @author       CubeSky
 // @match        http://*/*
@@ -26,6 +26,17 @@
       'https://huggingface.co/spaces/k2-fsa/web-assembly-vad-asr-sherpa-onnx-zh-zipformer-ctc/resolve/main/',
       'https://hf-mirror.com/spaces/k2-fsa/web-assembly-vad-asr-sherpa-onnx-zh-zipformer-ctc/resolve/main/',
     ],
+    primaryScriptConnectTimeoutMs: 3000,
+    primaryFetchConnectTimeoutMs: 4000,
+
+    // Transfer robustness for the large ASR .data package.
+    downloadStallTimeoutMs: 10000,
+    downloadSpeedWindowMs: 12000,
+    downloadSpeedGraceMs: 8000,
+    downloadMinBytesPerSec: 96 * 1024,
+    downloadRetryPerSource: 2,
+    scriptRetryPerSource: 2,
+    retryDelayMs: 650,
 
     scripts: [
       'sherpa-onnx-asr.js',
@@ -129,8 +140,8 @@
 
   window[KEY] = state;
 
-  const log = (...args) => console.log('[norios-voice 4.5]', ...args);
-  const warn = (...args) => console.warn('[norios-voice 4.5]', ...args);
+  const log = (...args) => console.log('[norios-voice 4.8]', ...args);
+  const warn = (...args) => console.warn('[norios-voice 4.8]', ...args);
 
   function getPrimaryAssetBase() {
     return CFG.assetBases[0];
@@ -154,6 +165,11 @@
     log('ASR asset base:', base);
   }
 
+  // Use this for assets whose bytes must be read in JavaScript
+  // (most importantly the large .data model cache).
+  //
+  // Do NOT use it for classic ASR .js files: cross-origin fetch requires
+  // CORS, while <script src> has different cross-origin loading semantics.
   async function fetchWithAssetFallback(
     filename,
     options = {},
@@ -169,13 +185,41 @@
       const base = bases[i];
       const url = assetUrl(filename, base);
 
+      const controller =
+        i === 0 ? new AbortController() : null;
+
+      let timer = null;
+
       try {
+        if (controller) {
+          timer = setTimeout(() => {
+            try {
+              controller.abort(
+                new DOMException(
+                  'Hugging Face connection timeout',
+                  'TimeoutError'
+                )
+              );
+            } catch {
+              controller.abort();
+            }
+          }, CFG.primaryFetchConnectTimeoutMs);
+        }
+
         const response = await fetch(url, {
           mode: 'cors',
           credentials: 'omit',
           cache: 'no-cache',
           ...options,
+          ...(controller ? { signal: controller.signal } : {}),
         });
+
+        // Headers arrived: do not apply the connection timeout to the
+        // subsequent large streaming download.
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
 
         if (!response.ok) {
           throw new Error(
@@ -199,17 +243,31 @@
 
         switchActiveAssetBase(base);
 
-        return {
-          response,
-          base,
-          url,
-        };
+        return { response, base, url };
       } catch (err) {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+
         lastError = err;
-        warn('ASR asset fetch failed:', url, err);
+
+        const timeout =
+          err?.name === 'AbortError' ||
+          err?.name === 'TimeoutError' ||
+          /timeout|超时/i.test(String(err?.message || err));
+
+        warn(
+          timeout
+            ? 'ASR primary asset connection timed out:'
+            : 'ASR asset fetch failed:',
+          url,
+          err
+        );
 
         if (i + 1 < bases.length) {
           const nextBase = bases[i + 1];
+
           onFallback?.(
             nextBase,
             assetUrl(filename, nextBase)
@@ -227,7 +285,6 @@
       `\n最后错误: ${lastError?.message || lastError}`
     );
   }
-
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -587,87 +644,416 @@
   }
 
   async function downloadModelBlobWithProgress(filename) {
-    updateProgress(
-      22,
-      '正在下载中文语音模型',
-      '正在连接 Hugging Face…'
+    const bases = Array.from(
+      new Set(CFG.assetBases.filter(Boolean))
     );
 
-    const { response, base } =
-      await fetchWithAssetFallback(
-        filename,
-        {},
-        (fallbackBase) => {
-          updateProgress(
-            22,
-            '切换国内镜像',
-            `正在尝试 ${fallbackBase}`
-          );
-        }
-      );
-
-    switchActiveAssetBase(base);
-
-    const total =
-      Number(response.headers.get('content-length')) || 0;
-
-    if (!response.body?.getReader) {
-      const blob = await response.blob();
-
-      updateProgress(
-        89,
-        '模型下载完成',
-        `${(blob.size / 1024 / 1024).toFixed(1)} MiB`
-      );
-
-      return blob;
-    }
-
-    const reader = response.body.getReader();
-    const chunks = [];
+    let chunks = [];
     let loaded = 0;
+    let expectedTotal = 0;
+    let lastError = null;
+    let canResume = false;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    const resetPartial = () => {
+      chunks = [];
+      loaded = 0;
+      expectedTotal = 0;
+      canResume = false;
+    };
 
-      chunks.push(value);
-      loaded += value.byteLength;
+    const sleepRetry = async (attempt) => {
+      await sleep(CFG.retryDelayMs * attempt);
+    };
 
-      if (total > 0) {
-        updateProgress(
-          22 + (loaded / total) * 66,
-          base === getPrimaryAssetBase()
-            ? '正在下载中文语音模型'
-            : '正在通过国内镜像下载模型',
-          `${(loaded / 1024 / 1024).toFixed(1)} MiB / ` +
-          `${(total / 1024 / 1024).toFixed(1)} MiB`
+    for (let sourceIndex = 0; sourceIndex < bases.length; sourceIndex++) {
+      const base = bases[sourceIndex];
+
+      for (
+        let attempt = 1;
+        attempt <= CFG.downloadRetryPerSource;
+        attempt++
+      ) {
+        const resumeOffset = loaded;
+        const headers = new Headers();
+
+        if (resumeOffset > 0 && canResume) {
+          headers.set('Range', `bytes=${resumeOffset}-`);
+        }
+
+        const controller = new AbortController();
+
+        let connectTimer = setTimeout(() => {
+          try {
+            controller.abort(
+              new DOMException(
+                'Download connection timeout',
+                'TimeoutError'
+              )
+            );
+          } catch {
+            controller.abort();
+          }
+        }, sourceIndex === 0
+          ? CFG.primaryFetchConnectTimeoutMs
+          : CFG.primaryFetchConnectTimeoutMs + 2500
         );
-      } else {
+
+        const url = assetUrl(filename, base);
+
+        try {
+          updateProgress(
+            loaded > 0 ? 30 : 22,
+            sourceIndex === 0
+              ? (
+                  attempt > 1
+                    ? '重试 Hugging Face 模型下载'
+                    : '正在下载中文语音模型'
+                )
+              : (
+                  attempt > 1
+                    ? '重试国内镜像模型下载'
+                    : '正在通过国内镜像下载模型'
+                ),
+            loaded > 0
+              ? `尝试续传 ${(loaded / 1024 / 1024).toFixed(1)} MiB`
+              : `连接 ${base}`
+          );
+
+          const response = await fetch(url, {
+            method: 'GET',
+            mode: 'cors',
+            credentials: 'omit',
+            cache: 'no-cache',
+            headers,
+            signal: controller.signal,
+          });
+
+          if (connectTimer) {
+            clearTimeout(connectTimer);
+            connectTimer = null;
+          }
+
+          if (!response.ok && response.status !== 206) {
+            throw new Error(
+              `HTTP ${response.status} ${response.statusText}`
+            );
+          }
+
+          const contentType =
+            (response.headers.get('content-type') || '').toLowerCase();
+
+          if (contentType.includes('text/html')) {
+            throw new Error('模型 URL 返回了 HTML');
+          }
+
+          const contentRange =
+            response.headers.get('content-range') || '';
+
+          const acceptRanges =
+            (response.headers.get('accept-ranges') || '')
+              .toLowerCase();
+
+          const isPartial =
+            response.status === 206 &&
+            /^bytes\s+\d+-\d+\/\d+$/i.test(contentRange);
+
+          if (resumeOffset > 0) {
+            if (!isPartial) {
+              // Server ignored Range and returned a fresh 200 response.
+              // Restart safely rather than concatenating duplicate bytes.
+              warn(
+                'ASR server did not honor Range; restarting from zero:',
+                url
+              );
+              resetPartial();
+            } else {
+              const m = contentRange.match(
+                /^bytes\s+(\d+)-(\d+)\/(\d+)$/i
+              );
+
+              if (
+                !m ||
+                Number(m[1]) !== resumeOffset
+              ) {
+                throw new Error(
+                  `Range offset mismatch: wanted ${resumeOffset}, got ${contentRange}`
+                );
+              }
+
+              expectedTotal = Number(m[3]) || expectedTotal;
+            }
+          }
+
+          if (loaded === 0) {
+            const length =
+              Number(response.headers.get('content-length')) || 0;
+
+            expectedTotal =
+              isPartial
+                ? (
+                    Number(
+                      contentRange.match(/\/(\d+)$/)?.[1]
+                    ) || 0
+                  )
+                : length;
+          }
+
+          canResume =
+            isPartial ||
+            acceptRanges.includes('bytes');
+
+          if (!response.body?.getReader) {
+            const blob = await response.blob();
+
+            if (loaded > 0 && isPartial) {
+              chunks.push(
+                new Uint8Array(await blob.arrayBuffer())
+              );
+              loaded += blob.size;
+
+              const finalBlob = new Blob(chunks, {
+                type:
+                  contentType ||
+                  'application/octet-stream',
+              });
+
+              updateProgress(
+                89,
+                '模型下载完成',
+                `${(finalBlob.size / 1024 / 1024).toFixed(1)} MiB`
+              );
+
+              switchActiveAssetBase(base);
+              return finalBlob;
+            }
+
+            updateProgress(
+              89,
+              '模型下载完成',
+              `${(blob.size / 1024 / 1024).toFixed(1)} MiB`
+            );
+
+            switchActiveAssetBase(base);
+            return blob;
+          }
+
+          const reader = response.body.getReader();
+
+          let lastChunkAt = performance.now();
+          let windowStartedAt = lastChunkAt;
+          let windowStartedBytes = loaded;
+          const transferStartedAt = lastChunkAt;
+
+          const watchdog = setInterval(() => {
+            const now = performance.now();
+
+            // No body data at all for too long.
+            if (
+              now - lastChunkAt >
+              CFG.downloadStallTimeoutMs
+            ) {
+              warn(
+                'ASR model download stalled:',
+                `${Math.round(now - lastChunkAt)}ms without data`
+              );
+
+              try {
+                controller.abort(
+                  new DOMException(
+                    'Download stalled',
+                    'TimeoutError'
+                  )
+                );
+              } catch {
+                controller.abort();
+              }
+
+              return;
+            }
+
+            const elapsedWindow =
+              now - windowStartedAt;
+
+            const elapsedTotal =
+              now - transferStartedAt;
+
+            if (
+              elapsedTotal >= CFG.downloadSpeedGraceMs &&
+              elapsedWindow >= CFG.downloadSpeedWindowMs
+            ) {
+              const bytesInWindow =
+                loaded - windowStartedBytes;
+
+              const bytesPerSec =
+                bytesInWindow /
+                (elapsedWindow / 1000);
+
+              if (
+                bytesPerSec <
+                CFG.downloadMinBytesPerSec
+              ) {
+                warn(
+                  'ASR model download too slow:',
+                  `${(bytesPerSec / 1024).toFixed(1)} KiB/s`
+                );
+
+                try {
+                  controller.abort(
+                    new DOMException(
+                      'Download speed below threshold',
+                      'TimeoutError'
+                    )
+                  );
+                } catch {
+                  controller.abort();
+                }
+
+                return;
+              }
+
+              windowStartedAt = now;
+              windowStartedBytes = loaded;
+            }
+          }, 1000);
+
+          try {
+            while (true) {
+              const { done, value } =
+                await reader.read();
+
+              if (done) break;
+
+              chunks.push(value);
+              loaded += value.byteLength;
+              lastChunkAt = performance.now();
+
+              const total = expectedTotal;
+
+              if (total > 0) {
+                const pct =
+                  Math.min(
+                    88,
+                    22 + (loaded / total) * 66
+                  );
+
+                updateProgress(
+                  pct,
+                  sourceIndex === 0
+                    ? '正在下载中文语音模型'
+                    : '正在通过国内镜像下载模型',
+                  `${(loaded / 1024 / 1024).toFixed(1)} MiB / ` +
+                  `${(total / 1024 / 1024).toFixed(1)} MiB`
+                );
+              } else {
+                updateProgress(
+                  55,
+                  sourceIndex === 0
+                    ? '正在下载中文语音模型'
+                    : '正在通过国内镜像下载模型',
+                  `已接收 ${(loaded / 1024 / 1024).toFixed(1)} MiB`
+                );
+              }
+            }
+          } finally {
+            clearInterval(watchdog);
+          }
+
+          const blob = new Blob(chunks, {
+            type:
+              contentType ||
+              'application/octet-stream',
+          });
+
+          if (
+            expectedTotal > 0 &&
+            blob.size !== expectedTotal
+          ) {
+            throw new Error(
+              `模型长度不完整: ${blob.size}/${expectedTotal}`
+            );
+          }
+
+          updateProgress(
+            89,
+            '模型下载完成',
+            `${(blob.size / 1024 / 1024).toFixed(1)} MiB`
+          );
+
+          switchActiveAssetBase(base);
+
+          return blob;
+        } catch (err) {
+          if (connectTimer) {
+            clearTimeout(connectTimer);
+            connectTimer = null;
+          }
+
+          lastError = err;
+
+          const resumableText =
+            loaded > 0
+              ? (
+                  canResume
+                    ? `，保留 ${(loaded / 1024 / 1024).toFixed(1)} MiB 等待续传`
+                    : '，服务器不支持续传，将重新下载'
+                )
+              : '';
+
+          warn(
+            'ASR model transfer failed:',
+            url,
+            `attempt=${attempt}`,
+            err,
+            resumableText
+          );
+
+          if (loaded > 0 && !canResume) {
+            resetPartial();
+          }
+
+          if (
+            attempt <
+            CFG.downloadRetryPerSource
+          ) {
+            updateProgress(
+              30,
+              '下载中断，正在重试',
+              canResume && loaded > 0
+                ? `从 ${(loaded / 1024 / 1024).toFixed(1)} MiB 继续`
+                : `重新连接 ${base}`
+            );
+
+            await sleepRetry(attempt);
+            continue;
+          }
+
+          break;
+        }
+      }
+
+      if (sourceIndex + 1 < bases.length) {
+        const nextBase = bases[sourceIndex + 1];
+
+        // Range resume across mirrors is only safe when the mirror confirms
+        // the exact requested byte offset with HTTP 206. The next request
+        // performs that validation; otherwise it automatically restarts.
         updateProgress(
-          55,
-          base === getPrimaryAssetBase()
-            ? '正在下载中文语音模型'
-            : '正在通过国内镜像下载模型',
-          `已接收 ${(loaded / 1024 / 1024).toFixed(1)} MiB`
+          30,
+          '切换国内镜像',
+          loaded > 0
+            ? `尝试从 ${(loaded / 1024 / 1024).toFixed(1)} MiB 继续`
+            : `正在尝试 ${nextBase}`
         );
       }
     }
 
-    const blob = new Blob(chunks, {
-      type:
-        response.headers.get('content-type') ||
-        'application/octet-stream',
-    });
-
-    updateProgress(
-      89,
-      '模型下载完成',
-      `${(blob.size / 1024 / 1024).toFixed(1)} MiB`
+    throw new Error(
+      `ASR 模型下载失败: ${filename}\n` +
+      `已尝试 Hugging Face 与国内镜像，并执行断线/低速重试。\n` +
+      `最后错误: ${lastError?.message || lastError}`
     );
-
-    return blob;
   }
+
 
   async function prepareCachedModelBlob() {
     updateProgress(7, '检查本地模型缓存', '正在查询 IndexedDB…');
@@ -2006,6 +2392,128 @@
     });
   }
 
+  async function loadAsrScriptWithFallback(doc, filename) {
+    const bases = Array.from(
+      new Set(CFG.assetBases.filter(Boolean))
+    );
+
+    let lastError = null;
+
+    for (let i = 0; i < bases.length; i++) {
+      const base = bases[i];
+      const url = assetUrl(filename, base);
+
+      for (
+        let attempt = 1;
+        attempt <= CFG.scriptRetryPerSource;
+        attempt++
+      ) {
+        if (i > 0 || attempt > 1) {
+          updateProgress(
+            88,
+            i > 0 ? '切换国内镜像' : '重试 Hugging Face',
+            `${filename} // ${attempt}/${CFG.scriptRetryPerSource}`
+          );
+        }
+
+        const baseElement = doc.querySelector('base');
+        if (baseElement) {
+          baseElement.href = base;
+        }
+
+        try {
+          const timeoutMs =
+            i === 0
+              ? CFG.primaryScriptConnectTimeoutMs
+              : CFG.primaryScriptConnectTimeoutMs + 2000;
+
+          await new Promise((resolve, reject) => {
+            const s = doc.createElement('script');
+            let settled = false;
+            let timer = null;
+
+            s.src =
+              url +
+              (url.includes('?') ? '&' : '?') +
+              `norios_retry=${attempt}_${Date.now()}`;
+            s.async = false;
+
+            const finish = (fn, value) => {
+              if (settled) return;
+              settled = true;
+
+              if (timer) clearTimeout(timer);
+
+              s.onload = null;
+              s.onerror = null;
+
+              fn(value);
+            };
+
+            s.onload = () => finish(resolve);
+            s.onerror = () => finish(
+              reject,
+              new Error(`iframe 脚本加载失败: ${url}`)
+            );
+
+            timer = setTimeout(() => {
+              if (settled) return;
+
+              try { s.remove(); } catch {}
+
+              finish(
+                reject,
+                new Error(
+                  `脚本连接超时 (${timeoutMs} ms): ${url}`
+                )
+              );
+            }, timeoutMs);
+
+            doc.head.appendChild(s);
+          });
+
+          switchActiveAssetBase(base);
+          log(
+            'ASR script loaded:',
+            url,
+            `attempt=${attempt}`
+          );
+
+          return { base, url };
+        } catch (err) {
+          lastError = err;
+          warn(
+            'ASR script load failed:',
+            url,
+            `attempt=${attempt}`,
+            err
+          );
+
+          if (attempt < CFG.scriptRetryPerSource) {
+            await sleep(CFG.retryDelayMs * attempt);
+          }
+        }
+      }
+
+      if (i + 1 < bases.length) {
+        updateProgress(
+          88,
+          '切换国内镜像',
+          `Hugging Face 不稳定，正在尝试 ${bases[i + 1]}`
+        );
+      }
+    }
+
+    throw new Error(
+      `ASR 脚本加载失败: ${filename}\n` +
+      `已尝试:\n` +
+      bases.map(
+        base => `  ${assetUrl(filename, base)}`
+      ).join('\n') +
+      `\n最后错误: ${lastError?.message || lastError}`
+    );
+  }
+
   async function ensureSherpaLoaded() {
     if (state.ready) return;
     if (state.loadingPromise) return state.loadingPromise;
@@ -2093,45 +2601,7 @@
           );
         }
 
-        const { response, base } = await fetchWithAssetFallback(
-          file,
-          {},
-          (fallbackBase) => {
-            updateProgress(
-              88,
-              '切换国内镜像',
-              `正在尝试 ${fallbackBase}${file}`
-            );
-          }
-        );
-
-        switchActiveAssetBase(base);
-
-        const baseElement = doc.querySelector('base');
-        if (baseElement) {
-          baseElement.href = base;
-        }
-
-        const scriptText = await response.text();
-        const trimmed = scriptText.trimStart();
-
-        if (trimmed.startsWith('<')) {
-          throw new Error(
-            `ASR 脚本返回 HTML: ${assetUrl(file, base)}`
-          );
-        }
-
-        const blob = new Blob([scriptText], {
-          type: 'text/javascript',
-        });
-
-        const blobUrl = URL.createObjectURL(blob);
-
-        try {
-          await loadScriptIntoFrame(doc, blobUrl);
-        } finally {
-          URL.revokeObjectURL(blobUrl);
-        }
+        await loadAsrScriptWithFallback(doc, file);
       }
 
       updateProgress(97, '初始化语音识别引擎', '正在创建 VAD / ASR 实例…');
